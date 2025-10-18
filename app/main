@@ -158,6 +158,9 @@ async def receive_request(data: RequestData, background_tasks: BackgroundTasks):
         print(f"⚠ Duplicate request detected for {key}. Re-notifying only.")
         prev = processed[key]
         notify_evaluation_server(data_dict.get("evaluation_url"), prev)
+
+app = FastAPI()
+
         return {"status": "ok", "note": "duplicate handled & re-notified"}
 
     background_tasks.add_task(process_request, data_dict)
