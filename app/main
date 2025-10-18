@@ -1,24 +1,46 @@
-from fastapi import FastAPI, Request, BackgroundTasks
-import os, json, base64
+from fastapi import FastAPI, BackgroundTasks
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+import os, json, base64
 from app.llm_generator import generate_app_code, decode_attachments
 from app.github_utils import (
     create_repo,
     create_or_update_file,
     enable_pages,
     generate_mit_license,
+    create_or_update_binary_file
 )
 from app.notify import notify_evaluation_server
-from app.github_utils import create_or_update_binary_file
 
+# Load environment variables
 load_dotenv()
 USER_SECRET = os.getenv("USER_SECRET")
 USERNAME = os.getenv("GITHUB_USERNAME")
 PROCESSED_PATH = "/tmp/processed_requests.json"
 
-app = FastAPI()
+app = FastAPI(
+    title="TDS Project 1 API",
+    description="Handles code generation, GitHub repo creation, and evaluation notification.",
+    version="1.0.0"
+)
 
-# === Persistence for processed requests ===
+# === Request Schema for Swagger ===
+class Attachment(BaseModel):
+    name: str
+    url: str
+
+class RequestData(BaseModel):
+    secret: str = Field(..., description="Secret key to verify the request.")
+    email: str = Field(..., description="Student or user email.")
+    task: str = Field(..., description="Unique task ID.")
+    round: int = Field(..., description="Round number (1 or 2).")
+    nonce: str = Field(..., description="Random unique nonce for request validation.")
+    evaluation_url: str = Field(..., description="Callback URL for evaluation server.")
+    brief: str = Field(..., description="Brief description of the app to generate.")
+    attachments: list[Attachment] = Field(default_factory=list)
+    checks: list[str] = Field(default_factory=list)
+
+# === Local persistence ===
 def load_processed():
     if os.path.exists(PROCESSED_PATH):
         try:
@@ -30,8 +52,8 @@ def load_processed():
 def save_processed(data):
     json.dump(data, open(PROCESSED_PATH, "w"), indent=2)
 
-# === Background task ===
-def process_request(data):
+# === Background processing ===
+def process_request(data: dict):
     round_num = data.get("round", 1)
     task_id = data["task"]
     print(f"⚙ Starting background process for task {task_id} (round {round_num})")
@@ -40,13 +62,13 @@ def process_request(data):
     saved_attachments = decode_attachments(attachments)
     print("Attachments saved:", saved_attachments)
 
-    # Optional: fetch previous README for round 2
     prev_readme = None
     if round_num == 2:
         try:
+            repo = create_repo(task_id)
             readme = repo.get_contents("README.md")
             prev_readme = readme.decoded_content.decode("utf-8", errors="ignore")
-            print("📖 Loaded previous README for round 2 context.")
+            print("📄 Loaded previous README for round 2 context.")
         except Exception:
             prev_readme = None
 
@@ -56,53 +78,43 @@ def process_request(data):
         checks=data.get("checks", []),
         round_num=round_num,
         prev_readme=prev_readme
-        )
+    )
 
     files = gen.get("files", {})
     saved_info = gen.get("attachments", [])
 
-    # Step 1: Get or create repo
     repo = create_repo(task_id, description=f"Auto-generated app for task: {data['brief']}")
 
-    # Step 2: Round-specific logic
+    # Round 1: fresh repo
     if round_num == 1:
-        print("🏗 Round 1: Building fresh repo...")
-        # Add attachments
+        print("🏗 Round 1: Building new repo...")
         for att in saved_info:
-            path = att["name"]
             try:
                 with open(att["path"], "rb") as f:
                     content_bytes = f.read()
                 if att["mime"].startswith("text") or att["name"].endswith((".md", ".csv", ".json", ".txt")):
                     text = content_bytes.decode("utf-8", errors="ignore")
-                    create_or_update_file(repo, path, text, f"Add attachment {path}")
+                    create_or_update_file(repo, att["name"], text, f"Add attachment {att['name']}")
                 else:
-                    create_or_update_binary_file(repo, path, content_bytes, f"Add binary {path}")
-                    b64 = base64.b64encode(content_bytes).decode("utf-8")
-                    create_or_update_file(repo, f"attachments/{att['name']}.b64", b64, f"Backup {att['name']}.b64")
+                    create_or_update_binary_file(repo, att["name"], content_bytes, f"Add binary {att['name']}")
             except Exception as e:
                 print("⚠ Attachment commit failed:", e)
     else:
-        print("🔁 Round 2: Revising existing repo...")
-        # For round 2, update existing code and README
-        # Commit new files on top of existing repo
+        print("🔁 Round 2: Updating existing repo...")
         for fname, content in files.items():
             create_or_update_file(repo, fname, content, f"Update {fname} for round 2")
 
-    # Step 3: Common steps for both rounds
+    # Common: write files
     for fname, content in files.items():
         create_or_update_file(repo, fname, content, f"Add/Update {fname}")
 
     mit_text = generate_mit_license()
     create_or_update_file(repo, "LICENSE", mit_text, "Add MIT license")
 
-    # Step 6: Handle GitHub Pages enablement or reuse existing
-    if data["round"] == 1:
+    if round_num == 1:
         pages_ok = enable_pages(task_id)
         pages_url = f"https://{USERNAME}.github.io/{task_id}/" if pages_ok else None
     else:
-        # For round 2 or later, Pages already exist
-        pages_ok = True
         pages_url = f"https://{USERNAME}.github.io/{task_id}/"
 
     try:
@@ -129,30 +141,24 @@ def process_request(data):
 
     print(f"✅ Finished round {round_num} for {task_id}")
 
-
 # === Main endpoint ===
 @app.post("/api-endpoint")
-async def receive_request(request: Request, background_tasks: BackgroundTasks):
-    data = await request.json()
-    print("📩 Received request:", data)
+async def receive_request(data: RequestData, background_tasks: BackgroundTasks):
+    data_dict = data.model_dump()
+    print("📥 Received request:", data_dict)
 
-    # Step 0: Verify secret
-    if data.get("secret") != USER_SECRET:
-        print("❌ Invalid secret received.")
+    if data_dict.get("secret") != USER_SECRET:
+        print("⛔ Invalid secret received.")
         return {"error": "Invalid secret"}
 
     processed = load_processed()
-    key = f"{data['email']}::{data['task']}::round{data['round']}::nonce{data['nonce']}"
+    key = f"{data_dict['email']}::{data_dict['task']}::round{data_dict['round']}::nonce{data_dict['nonce']}"
 
-    # Duplicate detection
     if key in processed:
         print(f"⚠ Duplicate request detected for {key}. Re-notifying only.")
         prev = processed[key]
-        notify_evaluation_server(data.get("evaluation_url"), prev)
+        notify_evaluation_server(data_dict.get("evaluation_url"), prev)
         return {"status": "ok", "note": "duplicate handled & re-notified"}
 
-    # Schedule background task (non-blocking)
-    background_tasks.add_task(process_request, data)
-
-    # Immediate HTTP 200 acknowledgment
-    return {"status": "accepted", "note": f"processing round {data['round']} started"}
+    background_tasks.add_task(process_request, data_dict)
+    return {"status": "accepted", "note": f"Processing round {data_dict['round']} started"}
